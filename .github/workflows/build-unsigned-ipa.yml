@@ -1,0 +1,102 @@
+# .github/workflows/build-unsigned-ipa.yml
+#
+# Builds TurboMeta (CameraAccess.xcodeproj) on a GitHub-hosted macOS runner
+# and uploads an UNSIGNED .ipa as a workflow artifact.
+#
+# You sign it yourself afterwards with Sideloadly / AltStore / SideStore.
+# Run it from: Actions tab -> "build unsigned ipa" -> "Run workflow".
+
+name: build unsigned ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle id to build with (must match what you register with Meta AND what you sign as). Leave blank to keep the project default."
+        required: false
+        default: ""
+      development_team:
+        description: "Your 10-char Apple Team ID. Leave blank on the first run; fill it in once you know it."
+        required: false
+        default: ""
+
+  # Uncomment if you want every push to main to build too.
+  # push:
+  #   branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    env:
+      # Optional. Add these under Settings -> Secrets and variables -> Actions
+      # so your Meta credentials never get committed to a public fork.
+      META_APP_ID: ${{ secrets.META_APP_ID }}
+      META_CLIENT_TOKEN: ${{ secrets.META_CLIENT_TOKEN }}
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+      DEV_TEAM: ${{ inputs.development_team }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: show toolchain and project layout
+        run: |
+          xcodebuild -version
+          xcodebuild -list -project CameraAccess.xcodeproj || true
+
+      # Skip this step entirely if you'd rather edit Info.plist directly in the repo.
+      - name: inject meta credentials into Info.plist
+        if: env.META_APP_ID != ''
+        run: |
+          set -e
+          plutil -replace MWDAT.MetaAppID   -string "$META_APP_ID"      CameraAccess/Info.plist
+          plutil -replace MWDAT.ClientToken -string "$META_CLIENT_TOKEN" CameraAccess/Info.plist
+          echo "injected (values not printed)"
+
+      - name: build unsigned .app
+        run: |
+          set -e
+
+          # Shared schemes are often not committed (xcuserdata is gitignored),
+          # so fall back to building the target directly if none is found.
+          SCHEME=$(xcodebuild -list -json -project CameraAccess.xcodeproj 2>/dev/null \
+            | python3 -c "import sys,json; print((json.load(sys.stdin)['project'].get('schemes') or [''])[0])" \
+            || echo "")
+
+          COMMON="-configuration Release -sdk iphoneos -derivedDataPath build \
+            CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO CODE_SIGN_ENTITLEMENTS="
+
+          EXTRA=""
+          if [ -n "$BUNDLE_ID" ]; then EXTRA="$EXTRA PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"; fi
+          if [ -n "$DEV_TEAM" ];   then EXTRA="$EXTRA DEVELOPMENT_TEAM=$DEV_TEAM"; fi
+
+          if [ -n "$SCHEME" ]; then
+            echo "building scheme: $SCHEME"
+            xcodebuild -project CameraAccess.xcodeproj -scheme "$SCHEME" $COMMON $EXTRA build
+          else
+            echo "no shared scheme found, building target CameraAccess"
+            xcodebuild -project CameraAccess.xcodeproj -target CameraAccess $COMMON $EXTRA build
+          fi
+
+      - name: package into .ipa
+        run: |
+          set -e
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          if [ -z "$APP" ]; then echo "no .app was produced"; exit 1; fi
+          echo "packaging $APP"
+
+          # Sanity check: an empty TeamID here means the Meta app-link handshake will fail.
+          plutil -extract MWDAT.TeamID raw "$APP/Info.plist" || echo "MWDAT.TeamID is empty"
+
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry TurboMeta-unsigned.ipa Payload
+          ls -lh TurboMeta-unsigned.ipa
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurboMeta-unsigned-ipa
+          path: TurboMeta-unsigned.ipa
+          retention-days: 7  
